@@ -1,0 +1,384 @@
+---
+title: "Prédiction de la note d'un animé"
+author: "Arnaud GRASSIAN et Vithuson VATHILINGAM GROUPE 2"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE,message=FALSE, warning=FALSE}
+install.packages("formatR")
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE, tidy.opts = list(width.cutoff = 80))
+```
+
+```{r}
+
+# On charge les librairies nécessaires
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(glmnet)
+  library(caret)
+  
+})
+# On charge le dataset 'anime_level.csv'
+df <- fread("anime_level.csv")
+
+# On vérifie les dimensions
+dim(df)
+```
+
+# Traitement des données
+
+```{r}
+#On supprime les colonnes avec plus de 50% des valeurs manquantes
+seuil_col <- 0.50 * nrow(df)
+cols_to_keep <- colSums(is.na(df)) <= seuil_col
+df_clean <- df[, ..cols_to_keep]
+cat("Après suppression colonnes vides :", ncol(df_clean), "colonnes.\n")
+
+#On supprime les lignes avec plus de 50% des valeurs manquantes
+row_na_percent <- rowMeans(is.na(df_clean))
+df_clean <- df_clean[row_na_percent <= 0.50, ]
+cat("Après suppression lignes vides :", nrow(df_clean), "lignes.\n")
+
+# On supprime les lignes restantes contenant des NA .
+df_final <- na.omit(df_clean)
+```
+
+# Parititonnement des données pour la modélisation
+
+```{r}
+#On définit  la variable cible que l'on cherche à prédire
+target_col <- "Y_score_global"
+
+#On liste les variables explicatives en excluant la cible et l'identifiant
+features_cols <- setdiff(names(df_final), c(target_col, "anime_mal_id"))
+
+#On fixe la graine aléatoire
+set.seed(2025) 
+
+#On génère les indices pour sélectionner 80% des données de manière stratifiée.
+train_index <- createDataPartition(df_final[[target_col]], p = 0.8, list = FALSE)
+
+#On crée le sous-ensemble d'entraînement contenant 80% des lignes.
+train_data <- df_final[train_index, ]
+
+# On crée le sous-ensemble de test
+test_data  <- df_final[-train_index, ]
+
+# On convertit les variables explicatives d'entraînement en matrice numérique
+X_train <- as.matrix(train_data[, ..features_cols])
+
+# On extrait le vecteur des notes cibles pour l'entraînement.
+y_train <- train_data[[target_col]]
+
+# On convertit les variables explicatives de test en matrice numérique.
+X_test <- as.matrix(test_data[, ..features_cols])
+
+# On extrait le vecteur des notes cibles pour l'évaluation
+y_test <- test_data[[target_col]]
+```
+
+# Modèle OLS
+
+```{r}
+# On prépare les données pour la fonction lm() qui attend un dataframe (et non une matrice).
+# On ne garde que la cible et les features (pas l'ID).
+data_ols_train <- train_data[, c(target_col, features_cols), with = FALSE]
+
+# On définit la formule
+formule <- as.formula(paste(target_col, "~ ."))
+
+# On entraîne le modèle linéaire 
+model_ols <- lm(formule, data = data_ols_train)
+
+# On affiche un résumé 
+cat("R2 ajusté  :", summary(model_ols)$adj.r.squared, "\n")
+```
+
+# Modèles intermédiaires
+
+## Ridge
+
+```{r}
+#On lance la validation croisée pour identifier le paramètre de pénalité optimal lambda.
+cv_ridge <- cv.glmnet(X_train, y_train, alpha = 0, family = "gaussian")
+
+# On visualise l'évolution de l'erreur quadratique moyenne (MSE) en fonction de lambda pour repérer le minimum.
+plot(cv_ridge)
+title("Ridge Cross-Validation", line = 2.5)
+
+# On construit le modèle  en utilisant le lambda qui a minimisé l'erreur
+ridge_min <- glmnet(X_train, y_train, alpha = 0, lambda = cv_ridge$lambda.min)
+
+# On construit le modèle en utilisant la règle du "1 Standard Error" (lambda.1se).
+ridge_1se <- glmnet(X_train, y_train, alpha = 0, lambda = cv_ridge$lambda.1se)
+
+#On affiche les valeurs  des lambda sélectionnés
+cat("Ridge Lambda min:", cv_ridge$lambda.min, "\n")
+cat("Ridge Lambda 1se:", cv_ridge$lambda.1se, "\n")
+
+
+# On trace le chemin de régularisation pour observer l'évolution des coefficients
+fit_ridge_plot <- glmnet(X_train, y_train, alpha = 0)
+plot(fit_ridge_plot, xvar = "lambda", label = TRUE, main="Chemin Ridge")
+
+```
+
+## Lasso
+
+```{r}
+#On lance la validation croisée pour identifier le paramètre de pénalité optimal lambda.
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1, family = "gaussian")
+
+# On visualise l'évolution de l'erreur quadratique moyenne (MSE) en fonction de lambda pour repérer le minimum.
+plot(cv_lasso)
+title("Lasso Cross-Validation", line = 2.5)
+
+# On construit le modèle en utilisant le lambda qui a minimisé l'erreur
+lasso_min <- glmnet(X_train, y_train, alpha = 1, lambda = cv_lasso$lambda.min)
+
+# On construit le modèle  en utilisant la règle du "1 Standard Error" (lambda.1se).
+lasso_1se <- glmnet(X_train, y_train, alpha = 1, lambda = cv_lasso$lambda.1se)
+
+#On affiche les valeurs exactes des lambda sélectionnés
+cat("Lasso Lambda min:", cv_lasso$lambda.min, "\n")
+cat("Lasso Lambda 1se:", cv_lasso$lambda.1se, "\n")
+
+# ON affiche les variables sélectionnées par le Lasso (non nulles)
+coef_l <- coef(lasso_1se)
+
+# On trace le chemin de régularisation pour observer l'évolution des coefficients
+fit_lasso_plot <- glmnet(X_train, y_train, alpha = 1)
+plot(fit_lasso_plot, xvar = "lambda", label = TRUE, main="Chemin Lasso")
+```
+
+## Elastic Net
+
+```{r}
+# On définit une grille de valeurs pour alpha (de 0.1 à 0.9) afin d'explorer les mélanges intermédiaires entre Ridge et Lasso.
+list_alpha <- seq(0.1, 0.9, by = 0.1)
+
+# On initialise un tableau pour enregistrer l'erreur minimale et le lambda associé à chaque configuration.
+results_en <- data.frame(alpha = list_alpha, cv_error = NA, lambda = NA)
+
+# On lance une boucle pour évaluer systématiquement la performance de chaque nuance de mélange
+for (i in 1:length(list_alpha)) {
+  a <- list_alpha[i]
+  # On exécute la validation croisée pour l'alpha courant afin de mesurer sa capacité prédictive.
+  cv_temp <- cv.glmnet(X_train, y_train, alpha = a, family = "gaussian")
+  
+  # On mémorise l'erreur minimale obtenue pour pouvoir comparer cet alpha aux autres.
+  results_en$cv_error[i] <- min(cv_temp$cvm)
+  results_en$lambda[i] <- cv_temp$lambda.min
+}
+
+# On sélectionne l'alpha qui a offert la plus faible erreur moyenne sur l'ensemble des tests.
+best_res <- results_en[which.min(results_en$cv_error), ]
+best_alpha <- best_res$alpha
+
+# On affiche l'alpha optimal retenu par l'algorithme .
+cat("Meilleur Alpha Elastic Net trouvé :", best_alpha, "\n")
+
+# On relance une validation croisée finale fixée sur cet alpha optimal
+cv_enet <- cv.glmnet(X_train, y_train, alpha = best_alpha, family = "gaussian")
+
+# On génère le modèle  combinant l'alpha optimal et la sélection de variables pour maximiser la parcimonie.
+enet_1se <- glmnet(X_train, y_train, alpha = best_alpha, lambda = cv_enet$lambda.1se)
+
+#On génère le modèle final  avec les mêmes hyperparamètres optimisés.
+enet_min <- glmnet(X_train, y_train, alpha = best_alpha, lambda = cv_enet$lambda.min)
+
+#On affiche les valeurs des lambda
+cat("Elastic net Lambda min:", cv_enet$lambda.min, "\n")
+cat("Elastic net Lambda 1se:", cv_enet$lambda.1se, "\n")
+```
+
+# Comparaison et Evaluation
+
+```{r}
+# On définit une fonction  pour calculer le RMSE  et le R^2  afin de rendre les modèles comparables.
+eval_model <- function(model, x_data, y_data, type="glmnet") {
+  if (type == "lm") {
+    preds <- predict(model, newdata = as.data.frame(x_data))
+  } else {
+    preds <- predict(model, newx = x_data)
+  }
+  
+  # Calculs métriques
+  rmse <- sqrt(mean((y_data - preds)^2))
+  sst <- sum((y_data - mean(y_data))^2)
+  sse <- sum((y_data - preds)^2)
+  r2 <- 1 - (sse / sst)
+  
+  return(c(RMSE = round(rmse, 4), R2 = round(r2, 4)))
+}
+
+# On applique cette évaluation uniforme sur l'ensemble de nos 7 modèles candidats (Ridge, Lasso, Elastic Net) en utilisant le jeu de test.
+res_ols <- eval_model(model_ols, X_test, y_test, type = "lm")
+res_ridge_min <- eval_model(ridge_min, X_test, y_test)
+res_ridge_1se <- eval_model(ridge_1se, X_test, y_test)
+res_lasso_min <- eval_model(lasso_min, X_test, y_test)
+res_lasso_1se <- eval_model(lasso_1se, X_test, y_test)
+res_enet_min  <- eval_model(enet_min, X_test, y_test)
+res_enet_1se  <- eval_model(enet_1se, X_test, y_test)
+
+# On rassemble l'ensemble des résultats dans un tableau récapitulatif unique pour faciliter l'analyse.
+final_table <- rbind(
+  "OLS (Standard)" = res_ols,
+  "Ridge (min)"   = res_ridge_min,
+  "Ridge (1se)"   = res_ridge_1se,
+  "Lasso (min)"   = res_lasso_min,
+  "Lasso (1se)"   = res_lasso_1se,
+  "Elastic Net (min)" = res_enet_min,
+  "Elastic Net (1se)" = res_enet_1se
+)
+
+# On affiche le classement final trié par RMSE croissant pour identifier objectivement le modèle offrant la meilleure précision prédictive.
+print(final_table[order(final_table[, "RMSE"]), ])
+```
+
+# Analyse de la corrélation entre les variables
+
+```{r}
+#On ne garde que les colonnes numériques pour le calcul
+cols_num <- sapply(df_final, is.numeric)
+df_corr_input <- df_final[, ..cols_num]
+
+#On retire la cible  et les identifiants
+vars_a_exclure <- c("Y_score_global", "anime_mal_id", "mal_id", "rank") 
+# On identifie les variables à conserver en soustrayant cette liste d'exclusion des noms de colonnes disponibles.
+vars_restantes <- setdiff(names(df_corr_input), vars_a_exclure)
+# On réduit le dataframe en ne sélectionnant que ces colonnes pertinentes pour préparer le calcul matriciel.
+df_corr_input <- df_corr_input[, ..vars_restantes]
+
+
+# On calcule la matrice de corrélation .
+cor_mat <- cor(df_corr_input, use = "pairwise.complete.obs")
+
+# On neutralise la diagonale et le triangle inférieur de la matrice pour éviter les redondances et les auto-corrélations.
+cor_mat[lower.tri(cor_mat, diag = TRUE)] <- NA
+# On transforme la matrice carrée en liste linéaire de corrélations.
+cor_list <- as.data.frame(as.table(cor_mat))
+# On filtre cette liste en supprimant les lignes devenues vides (NA) pour ne conserver que les corrélations uniques.
+cor_list <- na.omit(cor_list)
+
+# On trie la liste par valeur absolue décroissante afin de faire remonter les paires de variables les plus fortement liées (positivement ou négativement).
+cor_list_sorted <- cor_list[order(-abs(cor_list$Freq)), ]
+
+# On affiche les 20 corrélations les plus fortes
+cat("\n--- TOP 20 DES VARIABLES LES PLUS CORRÉLÉES ---\n")
+print(head(cor_list_sorted, 20))
+
+
+
+```
+
+# Analayse des résidus et diagnostic
+
+```{r}
+#On génère les prédictions finales sur le jeu de test en utilisant le modèle Elastic Net optimisé.
+best_preds <- predict(cv_enet, newx = X_test)
+#On calcule les résidus
+residuals <- y_test - best_preds
+
+# On configure la fenêtre graphique
+par(mfrow=c(1,2))
+# On trace le nuage de points comparant réalité et prédiction pour visualiser la qualité de l'ajustement.
+plot(y_test, best_preds, main="Prédiction vs Réalité", 
+     xlab="Note Réelle", ylab="Note Prédite", pch=19, col=rgb(0,0,1,0.2))
+# On ajoute la droite d'identité (y=x) servant de référence pour une prédiction parfaite.
+abline(0, 1, col="red", lwd=2)
+
+# On trace l'histogramme des erreurs pour vérifier leur centrage sur zéro et l'absence de biais systématique.
+hist(residuals, main="Distribution des Erreurs (Résidus)", 
+     xlab="Ecart (Note Réelle - Prédite)", col="lightblue", breaks=30)
+```
+
+# Comparaison détaillée : Réalité vs Prédiction
+
+```{r}
+# On construit un dataframe de synthèse regroupant la note réelle, la prédiction et l'écart pour chaque observation du test. 
+df_comparaison <- data.frame(
+  Note_Reelle = as.numeric(y_test),
+  Note_Predite = round(as.numeric(best_preds), 2),
+  Ecart = round(as.numeric(y_test - best_preds), 2)
+)
+
+# On affiche les 20 premières lignes .
+cat("\n--- Tableau Comparatif : Note Réelle vs Prédite  ---\n")
+print(head(df_comparaison, 20))
+
+# On calcule les statistiques descriptives des erreurs (Moyenne, Médiane, Quartiles) pour quantifier la dispersion globale du modèle.
+cat("\n--- Statistiques des erreurs ---\n")
+print(summary(df_comparaison$Ecart))
+```
+
+# Explication du succès d'un animé
+
+```{r}
+
+# On extrait les coefficients bruts du modèle Lasso parcimonieux (`1se`) qui a effectué la sélection de variables.
+coefs_raw <- coef(lasso_1se)
+
+# On convertit cette matrice creuse en un dataframe standard pour faciliter la manipulation.
+df_coefs <- data.frame(
+  Variable = rownames(coefs_raw),
+  Poids = as.vector(coefs_raw) 
+)
+
+# On nettoie le tableau en supprimant l'intercept (constante) et les variables dont le coefficient a été réduit à zéro (non sélectionnées).
+df_coefs <- df_coefs[df_coefs$Poids != 0 & df_coefs$Variable != "(Intercept)", ]
+
+# On trie les variables par ordre décroissant de valeur absolue pour identifier les facteurs ayant le plus fort impact (positif ou négatif).
+df_coefs <- df_coefs[order(-abs(df_coefs$Poids)), ]
+
+cat("\n--- TOP 20 DES FACTEURS D'INFLUENCE ---\n")
+print(head(df_coefs, 20))
+
+
+# On prend le Top 15 pour que ce soit lisible
+top_15 <- head(df_coefs, 15)
+
+```
+
+# Vérification du surapprentissage
+
+```{r}
+# On crée une liste contenant tous nos modèles pour pouvoir boucler dessus.
+tous_modeles <- list(
+  "OLS (Standard)"    = model_ols,
+  "Ridge (min)"       = ridge_min,
+  "Ridge (1se)"       = ridge_1se,
+  "Lasso (min)"       = lasso_min,
+  "Lasso (1se)"       = lasso_1se,
+  "Elastic Net (min)" = enet_min,
+  "Elastic Net (1se)" = enet_1se
+)
+
+# On prépare un tableau vide pour stocker les résultats comparatifs.
+tab_overfit <- data.frame(Modele=character(), R2_Train=numeric(), R2_Test=numeric(), Ecart=numeric(), stringsAsFactors=FALSE)
+
+# On boucle sur chaque modèle pour calculer son score sur le Train et sur le Test.
+for(nom in names(tous_modeles)) {
+  mod <- tous_modeles[[nom]]
+  type_mod <- if(inherits(mod, "lm")) "lm" else "glmnet"
+  
+  # Calcul sur le TRAIN 
+  res_train <- eval_model(mod, X_train, y_train,type=type_mod)
+  r2_train <- res_train["R2"]
+  
+  # Calcul sur le TEST 
+  res_test <- eval_model(mod, X_test, y_test,type=type_mod)
+  r2_test <- res_test["R2"]
+  
+  # On ajoute la ligne au tableau (Ecart = Train - Test)
+  tab_overfit[nrow(tab_overfit) + 1, ] <- list(nom, r2_train, r2_test, r2_train - r2_test)
+}
+
+# On affiche le tableau final complet
+print(tab_overfit[order(tab_overfit$Ecart), ])
+# On affiche le tableau
+print(tab_overfit)
+```

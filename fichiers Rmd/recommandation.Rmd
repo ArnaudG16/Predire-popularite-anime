@@ -1,0 +1,308 @@
+---
+title: "Recommandation"
+author: "Arnaud GRASSIAN et Vithuson VATHILINGAM GROUPE 2"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-12-06"
+---
+
+
+
+
+```{r setup, include=FALSE,message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE, tidy.opts = list(width.cutoff = 80))
+```
+
+# Chargement, Nettoyage et Création de la Cible 
+```{r}
+# On charge les librairies nécessaires
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(glmnet)
+  library(caret)
+  
+})
+
+# On charge les datasets 'anime_level.csv' et 'user_anime_level.csv'
+df_anime_source <- fread("anime_level.csv")
+df_user <- fread("user_anime_level.csv")
+
+# On réduit la taille de l'échantillon à 100 000 lignes  pour limiter le temps de calcul.
+if(nrow(df_user) > 100000) {
+  set.seed(2025)
+  df_user <- df_user[sample(.N, 100000)] 
+}
+
+# On transforme la note continue (1-10) en classe binaire : 1 si l'utilisateur a aimé (Note >= 7), sinon 0.
+df_user$Liked <- ifelse(df_user$Y_user_score >= 7, 1, 0)
+
+# On convertit la variable cible en facteur
+df_user$Liked <- as.factor(df_user$Liked)
+
+# On définit le seuil de tolérance des valeurs manquantes à 50% du nombre total d'observations.
+seuil_col <- 0.50 * nrow(df_user)
+# On identifie les colonnes dont le cumul de valeurs manquantes reste inférieur ou égal à ce seuil.
+cols_keep <- colSums(is.na(df_user)) <= seuil_col
+# On filtre le dataframe pour ne conserver que les colonnes avec moins de 50% de valeurs manquantes
+df_user <- df_user[, ..cols_keep]
+
+# On définit le seuil de tolérance des valeurs manquantes à 50% du nombre total d'observations.
+row_na_pct <- rowMeans(is.na(df_user))
+# On ne conserve que les lignes ayant au maximum 50 % de données manquantes pour garantir la fiabilité des données.
+df_user <- df_user[row_na_pct <= 0.50, ]
+
+
+# On supprime les lignes restantes contenant des NA .
+df_user_final <- na.omit(df_user)
+df_anime_source <- na.omit(df_anime_source)
+
+# On liste les colonnes techniques à exclure : l'ancien score continu, les identifiants et les pseudos.
+cols_to_remove <- c("Y_user_score", "username", "mal_id", "anime_mal_id")
+# On vérifie l'intersection pour ne retirer que les colonnes qui existent encore après le nettoyage.
+cols_to_remove <- intersect(names(df_user_final), cols_to_remove)
+# On définit la liste finale des features en excluant la cible 'Liked' et les variables techniques.
+features_cols <- setdiff(names(df_user_final), c("Liked", cols_to_remove))
+
+# On affiche les dimensions
+cat("Dimensions finales :", dim(df_user_final), "\n")
+
+# On affiche la répartition des classes (0/1)
+print(table(df_user_final$Liked))
+```
+
+# Partitionnement des données
+```{r}
+#On fixe la graine aléatoire
+set.seed(2025)
+
+#On génère les indices pour sélectionner 80% des données de manière stratifiée.
+train_idx <- createDataPartition(df_user_final$Liked, p = 0.8, list = FALSE)
+
+#On crée le sous-ensemble d'entraînement contenant 80% des lignes.
+train_u <- df_user_final
+# On crée le sous-ensemble de test
+test_u  <- df_user_final[-train_idx, ]
+
+# On convertit les variables explicatives d'entraînement en matrice numérique
+X_train <- data.matrix(train_u[, ..features_cols])
+# On isole le vecteur cible contenant les labels (0 ou 1) pour la phase d'apprentissage.
+y_train <- train_u$Liked
+# On convertit les variables explicatives d'entraînement en matrice numérique
+X_test <- data.matrix(test_u[, ..features_cols])
+# On isole le vecteur cible (labels réels) du jeu de test pour la future évaluation des performances.
+y_test <- test_u$Liked
+```
+# Modèles intermédiaires
+
+#Modèle logistique classique
+```{r}
+# Pour le modèle standard (glm), il faut un dataframe et non une matrice.
+# On reconstitue le jeu d'entraînement.
+df_train_std <- as.data.frame(X_train)
+df_train_std$Liked <- y_train
+
+# On entraîne le modèle logistique classique (équivalent OLS pour la classification).
+# 'family = binomial' indique qu'on travaille sur du 0/1.
+std_model <- glm(Liked ~ ., data = df_train_std, family = "binomial")
+
+```
+
+
+#Lasso
+
+```{r}
+# On lance la validation croisée avec alpha = 1 pour forcer la sélection de variables (Lasso).
+# On spécifie `family = "binomial"` pour la classification
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1, type.measure = "class")
+# On visualise la courbe d'erreur de classification en fonction de la pénalité pour identifier le point de bascule.
+plot(cv_lasso)
+
+# On instancie le modèle Lasso optimal qui offre le taux d'erreur le plus faible sur la validation croisée.
+lasso_model_min <- glmnet(X_train, y_train, family = "binomial", alpha = 1, lambda = cv_lasso$lambda.min)
+# On instancie le modèle Lasso le plus parcimonieux  qui simplifie le modèle tout en restant dans la marge d'erreur standard.
+lasso_model_1se <- glmnet(X_train, y_train, family = "binomial", alpha = 1, lambda = cv_lasso$lambda.1se)
+
+#On affiche les valeurs exactes des lambda sélectionnés
+cat("Lasso Lambda min:", cv_lasso$lambda.min, "\n")
+cat("Lasso Lambda 1se:", cv_lasso$lambda.1se, "\n")
+```
+
+#Ridge
+```{r}
+# On lance la validation croisée avec alpha = 0 pour conserver toutes les variables tout en réduisant leur impact 
+cv_ridge <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0, type.measure = "class")
+# On visualise l'erreur de classification pour vérifier la stabilité du modèle face à la régularisation.
+plot(cv_ridge)
+
+# On construit le modèle  en utilisant le lambda qui a minimisé l'erreur
+ridge_model_min <- glmnet(X_train, y_train, family = "binomial", alpha = 0, lambda = cv_ridge$lambda.min)
+# On construit le modèle en utilisant la règle du "1 Standard Error" (lambda.1se).
+ridge_model_1se <- glmnet(X_train, y_train, family = "binomial", alpha = 0, lambda = cv_ridge$lambda.1se)
+
+#On affiche les valeurs  des lambda sélectionnés
+cat("Ridge Lambda min:", cv_ridge$lambda.min, "\n")
+cat("Ridge Lambda 1se:", cv_ridge$lambda.1se, "\n")
+```
+
+## Elastic Net
+```{r}
+# On définit une grille de valeurs pour alpha (de 0.1 à 0.9) afin d'explorer les mélanges intermédiaires entre Ridge et Lasso.
+list_alpha <- seq(0.1, 0.9, by = 0.1)
+# On initialise un tableau pour enregistrer l'erreur minimale et le lambda associé à chaque configuration.
+results_en <- data.frame(alpha = list_alpha, cv_error = NA, lambda = NA)
+
+# On lance une boucle pour évaluer systématiquement la performance de chaque nuance de mélange
+for (i in 1:length(list_alpha)) {
+  a <- list_alpha[i]
+    # On exécute la validation croisée pour l'alpha courant afin de mesurer sa capacité prédictive.
+  cv_temp <- cv.glmnet(X_train, y_train, alpha = a, family = "binomial", type.measure = "class")
+  # On mémorise l'erreur minimale obtenue pour pouvoir comparer cet alpha aux autres.
+  results_en$cv_error[i] <- min(cv_temp$cvm)
+  results_en$lambda[i] <- cv_temp$lambda.min
+}
+
+# On sélectionne l'alpha qui a offert la plus faible erreur moyenne sur l'ensemble des tests.
+best_res <- results_en[which.min(results_en$cv_error), ]
+best_alpha <- best_res$alpha
+
+# On relance une validation croisée finale fixée sur cet alpha optimal
+cv_final_enet <- cv.glmnet(X_train, y_train, alpha = best_alpha, family = "binomial", type.measure = "class")
+
+# On instancie le modèle Elastic Net final de performance pure (`lambda.min`) sur l'ensemble d'entraînement.
+enet_model_min <- glmnet(X_train, y_train, alpha = best_alpha, family = "binomial", lambda = cv_final_enet$lambda.min)
+# On instancie le modèle Elastic Net final robuste (`lambda.1se`) favorisant la parcimonie.
+enet_model_1se <- glmnet(X_train, y_train, alpha = best_alpha, family = "binomial", lambda = cv_final_enet$lambda.1se)
+
+#On affiche les valeurs des lambda
+cat("Elastic Net Lambda min:", cv_final_enet$lambda.min, "\n")
+cat("Elastic Net Lambda 1se:", cv_final_enet$lambda.1se, "\n")
+```
+
+# Évaluation et Comparaison des Performances
+```{r}
+# On définit une fonction Accuracy pour mesurer la qualité de la classification.
+eval_classif <- function(model, x_data, y_true, nom_modele="Modèle") {
+  
+# On génère les probabilités d'appartenance à la classe 1 ("Aimé") pour les nouvelles données.
+probs <- predict(model, newx = x_data, type = "response")
+# On applique un seuil de décision à 50% : si probabilité > 0.5, on prédit 1, sinon 0.
+preds_class <- ifelse(probs > 0.5, 1, 0)
+
+# On construit la matrice de confusion  
+
+cm <- table(Réalité = y_true, Prédiction = preds_class)
+  
+print(cm)
+
+  
+# On calcule l'Accuracy globale : proportion de prédictions correctes sur le total des observations.
+accuracy <- sum(diag(cm)) / sum(cm)
+cat("Accuracy :", round(accuracy, 4), "\n")
+  
+return(accuracy)
+}
+
+# On calcule les scores de précision (Accuracy) pour les variantes Lasso sur le jeu de test.
+acc_lasso_min <- eval_classif(lasso_model_min, X_test, y_test, "Lasso (Min)")
+acc_lasso_1se <- eval_classif(lasso_model_1se, X_test, y_test, "Lasso (1se)")
+
+# On calcule les scores de précision (Accuracy) pour les variantes Ridge sur le jeu de test
+acc_ridge_min <- eval_classif(ridge_model_min, X_test, y_test, "Ridge (Min)")
+acc_ridge_1se <- eval_classif(ridge_model_1se, X_test, y_test, "Ridge (1se)")
+
+# On calcule les scores de précision (Accuracy) pour les variantes Elastic Net sur le jeu de test
+acc_enet_min  <- eval_classif(enet_model_min, X_test, y_test, "ELASTIC NET (Min)")
+acc_enet_1se  <- eval_classif(enet_model_1se, X_test, y_test, "ELASTIC NET (1se)")
+
+# On rassemble l'ensemble des résultats dans un tableau récapitulatif pour comparer les performances.
+final_tab <- data.frame(
+  Modele = c("Lasso (min)", "Lasso (1se)", "Ridge (min)", "Ridge (1se)", "Elastic Net (min)", "Elastic Net (1se)"),
+  Accuracy = c(acc_lasso_min, acc_lasso_1se, acc_ridge_min, acc_ridge_1se, acc_enet_min, acc_enet_1se)
+)
+
+# On trie et affiche le tableau par ordre décroissant d'Accuracy pour identifier le meilleur modèle prédictif.
+print(final_tab[order(-final_tab$Accuracy), ])
+```
+
+# Recommandation ciblée
+```{r}
+#On sélectionne un anime spécifique (ici la ligne 890) pour lequel on souhaite trouver l'audience idéale. 
+target_anime <- df_anime_source[890, ]
+#On affiche le titre de l'animé
+cat("Simulation pour l'anime :", target_anime$title, "\n") 
+
+# On extrait une liste unique d'utilisateurs pour éviter les doublons dans la recommandation.
+prediction_set <- df_user[!duplicated(username), ]
+
+# On identifie les colonnes communes entre l'anime et l'historique utilisateur (Genres, Studio, etc.).
+cols_communes <- intersect(names(target_anime), names(prediction_set))
+
+#On exclut les variables propres à l'utilisateur (Pseudo, Note moyenne) pour ne modifier que les infos de l'anime.
+cols_a_modifier <- setdiff(cols_communes, c("username", "Y_user_score", "Liked", "user_mean_score_from_ratings"))
+
+# On remplace les données existantes par les caractéristiques de l'anime cible pour *tous* les utilisateurs.
+for(col in cols_a_modifier) {
+  valeur_cible <- target_anime[[col]][1]
+  set(prediction_set, j = col, value = valeur_cible)
+}
+
+# On convertit ce jeu de données simulé en matrice numérique compatible avec le modèle Lasso entraîné.
+cols_valides <- intersect(features_cols, names(prediction_set))
+X_target <- data.matrix(prediction_set[, ..cols_valides])
+
+# On utilise le modèle Lasso (1se) pour prédire la probabilité ("type = response") que chaque utilisateur aime l'anime.
+scores_prob <- predict(lasso_model_1se, newx = X_target, type = "response")
+
+# On structure les résultats en convertissant la probabilité en un "Score de Compatibilité" (%).
+resultats <- data.frame(
+  Utilisateur = prediction_set$username,
+  Score_Compatibilite = round(as.numeric(scores_prob) * 100, 2) 
+)
+
+#On extrait le Top 30 des utilisateurs les plus susceptibles d'aimer l'œuvre.
+top_30 <- head(resultats[order(-resultats$Score_Compatibilite), ], 30)
+
+print(top_30)
+```
+# Vérification du surapprentissage
+```{r}
+# On définit une petite fonction locale pour récupérer juste l'Accuracy.
+get_acc_only <- function(model, x, y) {
+  p <- predict(model, newx = x, type = "response")
+  pred <- ifelse(p > 0.5, 1, 0)
+  return(sum(diag(table(y, pred))) / length(y))
+}
+
+# On liste les modèles
+liste_modeles <- list(
+  "Lasso (min)"       = lasso_model_min,
+  "Lasso (1se)"       = lasso_model_1se,
+  "Ridge (min)"       = ridge_model_min,
+  "Ridge (1se)"       = ridge_model_1se,
+  "Elastic Net (min)" = enet_model_min,
+  "Elastic Net (1se)" = enet_model_1se
+)
+
+# On prépare le tableau
+tab_overfit_classif <- data.frame(Modele=character(), Acc_Train=numeric(), Acc_Test=numeric(), Ecart=numeric(), stringsAsFactors=FALSE)
+
+# On boucle
+for(nom in names(liste_modeles)) {
+  mod <- liste_modeles[[nom]]
+  
+  # Calcul Accuracy Train
+  acc_train <- get_acc_only(mod, X_train, y_train)
+  
+  # Calcul Accuracy Test
+  acc_test <- get_acc_only(mod, X_test, y_test)
+  
+  # Ajout au tableau
+  tab_overfit_classif[nrow(tab_overfit_classif) + 1, ] <- list(nom, round(acc_train,4), round(acc_test,4), round(acc_train - acc_test, 4))
+}
+
+# On affiche le résultat trié par le plus petit écart
+print(tab_overfit_classif[order(tab_overfit_classif$Ecart), ])
+```
+
